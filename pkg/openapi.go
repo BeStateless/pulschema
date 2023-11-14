@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -17,8 +18,6 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/codegen"
 	dotnetgen "github.com/pulumi/pulumi/pkg/v3/codegen/dotnet"
 	pschema "github.com/pulumi/pulumi/pkg/v3/codegen/schema"
-
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
 const (
@@ -70,6 +69,32 @@ type OpenAPIContext struct {
 	// autoNameMap is a map of the resource type token
 	// and the property that can be auto-named.
 	autoNameMap map[string]string
+
+	CsharpNamespaces map[string]string
+
+	//
+	errorHandler func(err error)
+}
+
+func (o *OpenAPIContext) handleError(err error) {
+	if o.errorHandler == nil {
+		o.errorHandler = func(err error) { glog.Warningf(err.Error()) }
+	}
+	o.errorHandler(err)
+}
+
+type contractError struct {
+	msg string
+}
+
+func newContractError(format string, a ...any) contractError {
+	return contractError{
+		msg: fmt.Sprintf(format, a...),
+	}
+}
+
+func (c contractError) Error() string {
+	return c.msg
 }
 
 type duplicateEnumError struct {
@@ -256,6 +281,69 @@ func ensureIDHierarchyInRequestPath(path string, pathItem *openapi3.PathItem) st
 	return strings.Join(segments, pathSeparator)
 }
 
+type ErrorList struct {
+	Errors []error
+}
+
+func (e ErrorList) HasError() bool {
+	return len(e.Errors) > 0
+}
+
+func (e ErrorList) Error() string {
+	return fmt.Sprintf("Found %d errors", len(e.Errors))
+}
+
+func (e ErrorList) AddError(err error) {
+	if err != nil {
+		e.Errors = append(e.Errors, err)
+	}
+}
+
+func getRequestBodyContentJsonSchema(operation *openapi3.Operation) (*openapi3.Schema, error) {
+	jsonReq, err := getRequestBodyContentJson(operation)
+	if err != nil {
+		return nil, err
+	}
+	if jsonReq != nil {
+		if jsonReq.Schema != nil {
+			return jsonReq.Schema.Value, nil
+		}
+	}
+	return nil, errors.Errorf("no request schema for operation")
+}
+
+func getRequestBodyContentJson(operation *openapi3.Operation) (*openapi3.MediaType, error) {
+	return getRequestBodyContentMediaType(operation, jsonMimeType)
+}
+
+func getRequestBodyContentMediaType(operation *openapi3.Operation, mimeType string) (*openapi3.MediaType, error) {
+	if operation.RequestBody != nil && operation.RequestBody.Value != nil && operation.RequestBody.Value.Content != nil {
+		jsonMedia := operation.RequestBody.Value.Content.Get(mimeType)
+		if jsonMedia != nil {
+			return jsonMedia, nil
+		}
+		return nil,
+			errors.Errorf("no request body content for operation %s with mime type %s",
+				operation.OperationID, mimeType)
+	}
+	return nil, errors.Errorf("no request body content for operation %s", operation.OperationID)
+}
+
+func getResponseBodyContentMediaType(operation *openapi3.Operation, statusCode int, mimeType string) *openapi3.MediaType {
+	if operation.Responses != nil {
+		statusResponse := operation.Responses.Get(statusCode)
+		return getResponseMediaType(statusResponse, mimeType)
+	}
+	return nil
+}
+
+func getResponseMediaType(response *openapi3.ResponseRef, mimeType string) *openapi3.MediaType {
+	if response != nil && response.Value != nil && response.Value.Content != nil {
+		return response.Value.Content.Get(mimeType)
+	}
+	return nil
+}
+
 // GatherResourcesFromAPI gathers resources from API endpoints.
 // The goal is to extract resources and map their corresponding CRUD
 // operations.
@@ -268,13 +356,18 @@ func ensureIDHierarchyInRequestPath(path string, pathItem *openapi3.PathItem) st
 //     for resource updates. The Patch request schema is used to determine
 //     which properties can be patched when changes are detected in Diff() vs.
 //     which ones will force a resource replacement.
-func (o *OpenAPIContext) GatherResourcesFromAPI(csharpNamespaces map[string]string) (*ProviderMetadata, openapi3.T, error) {
+func (o *OpenAPIContext) GatherResourcesFromAPI() (*ProviderMetadata, openapi3.T, error) {
 	o.resourceCRUDMap = make(map[string]*CRUDOperationsMap)
 	o.autoNameMap = make(map[string]string)
 
-	for path, pathItem := range o.Doc.Paths {
-		// Capture the iteration variable `path` because we use its pointer
-		// in the crudMap.
+	paths := make([]string, 0, len(o.Doc.Paths))
+	for pathKey := range o.Doc.Paths {
+		paths = append(paths, pathKey)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		// Capture the iteration variable `path` because we use its pointer in the crudMap.
+		pathItem := o.Doc.Paths[path]
 		currentPath := ensureIDHierarchyInRequestPath(path, pathItem)
 		module := getModuleFromPath(currentPath, o.UseParentResourceAsModule)
 
@@ -284,303 +377,352 @@ func (o *OpenAPIContext) GatherResourcesFromAPI(csharpNamespaces map[string]stri
 
 		glog.V(3).Infof("Processing path %s as %s\n", path, currentPath)
 
-		if pathItem.Get != nil {
-			parentPath := getParentPath(currentPath)
-			glog.V(3).Infof("GET: Parent path for %s is %s\n", currentPath, parentPath)
-
-			jsonReq := pathItem.Get.Responses.Get(200).Value.Content.Get(jsonMimeType)
-			if jsonReq.Schema.Value == nil {
-				contract.Failf("Path %s has no schema definition for status code 200", currentPath)
-			}
-
-			setReadOperationMapping := func(tok string) {
-				if existing, ok := o.resourceCRUDMap[tok]; ok {
-					existing.R = &currentPath
-				} else {
-					o.resourceCRUDMap[tok] = &CRUDOperationsMap{
-						R: &currentPath,
-					}
-				}
-			}
-
-			resourceType := jsonReq.Schema.Value
-
-			// Use the type and operationID as a hint to determine if this GET endpoint returns a single resource
-			// or a list of resources.
-			if resourceType.Type != arrayType && !strings.Contains(strings.ToLower(pathItem.Get.OperationID), "list") {
-				// If there is a discriminator then we should set this operation
-				// as the read endpoint for each of the types in the mapping.
-				if resourceType.Discriminator != nil {
-					for _, ref := range resourceType.Discriminator.Mapping {
-						schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
-						dResource := o.Doc.Components.Schemas[schemaName]
-						ensureRequestSchemaTitle(schemaName, dResource)
-						typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
-						setReadOperationMapping(typeToken)
-
-						funcName := "get" + dResource.Value.Title
-						funcTypeToken := o.Pkg.Name + ":" + module + ":" + funcName
-						getterFuncSpec := o.genGetFunc(*pathItem, *dResource, module, funcName)
-						o.Pkg.Functions[funcTypeToken] = getterFuncSpec
-						setReadOperationMapping(funcTypeToken)
-					}
-				} else {
-					if resourceType.Title == "" {
-						resourceType.Title = getResourceTitleFromOperationID(pathItem.Get.OperationID, http.MethodGet, o.OperationIdsHaveTypeSpecNamespace)
-					}
-
-					typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
-					setReadOperationMapping(typeToken)
-
-					funcName := "get" + resourceType.Title
-					funcTypeToken := o.Pkg.Name + ":" + module + ":" + funcName
-					getterFuncSpec := o.genGetFunc(*pathItem, *jsonReq.Schema, module, funcName)
-					o.Pkg.Functions[funcTypeToken] = getterFuncSpec
-					setReadOperationMapping(funcTypeToken)
-				}
-			}
-
-			// Add the API operation as a list* function.
-			if resourceType.Type == arrayType || strings.Contains(strings.ToLower(pathItem.Get.OperationID), "list") {
-				var funcName string
-				if resourceType.Title != "" {
-					resourceType.Title = strings.ReplaceAll(resourceType.Title, "List", "")
-					if !strings.HasPrefix(resourceType.Title, "list") {
-						funcName = "list" + resourceType.Title
-					}
-				} else {
-					funcName = "list" + getResourceTitleFromOperationID(pathItem.Get.OperationID, http.MethodGet, o.OperationIdsHaveTypeSpecNamespace)
-				}
-				funcTypeToken := o.Pkg.Name + ":" + module + ":" + funcName
-				funcSpec, err := o.genListFunc(*pathItem, *jsonReq.Schema, funcName, module)
-				if err != nil {
-					return nil, o.Doc, errors.Wrap(err, "generating list function")
-				}
-
-				o.Pkg.Functions[funcTypeToken] = *funcSpec
-				setReadOperationMapping(funcTypeToken)
-			}
+		err := o.parseOperations(pathItem, currentPath, module)
+		if err != nil {
+			o.handleError(err)
 		}
-
-		if pathItem.Patch != nil {
-			parentPath := getParentPath(currentPath)
-			glog.V(3).Infof("PATCH: Parent path for %s is %s\n", currentPath, parentPath)
-
-			jsonReq := pathItem.Patch.RequestBody.Value.Content.Get(jsonMimeType)
-			if jsonReq.Schema.Value == nil {
-				contract.Failf("Path %s has no schema definition for Patch method", currentPath)
-			}
-
-			setUpdateOperationMapping := func(tok string) {
-				if existing, ok := o.resourceCRUDMap[tok]; ok {
-					existing.U = &currentPath
-				} else {
-					o.resourceCRUDMap[tok] = &CRUDOperationsMap{
-						U: &currentPath,
-					}
-				}
-			}
-
-			resourceType := jsonReq.Schema.Value
-			if resourceType.Title == "" {
-				resourceType.Title = getResourceTitleFromOperationID(pathItem.Patch.OperationID, http.MethodPatch, o.OperationIdsHaveTypeSpecNamespace)
-			}
-			if resourceType.Title == "" {
-				return nil, o.Doc, errors.Errorf("patch request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
-			}
-
-			if resourceType.Discriminator != nil || len(resourceType.OneOf) > 0 || len(resourceType.AnyOf) > 0 {
-				schemaNames := make([]string, 0)
-				if resourceType.Discriminator != nil {
-					for _, ref := range resourceType.Discriminator.Mapping {
-						schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
-						schemaNames = append(schemaNames, schemaName)
-					}
-				}
-
-				if len(resourceType.OneOf) > 0 {
-					for _, ref := range resourceType.OneOf {
-						schemaName := strings.TrimPrefix(ref.Ref, componentsSchemaRefPrefix)
-						schemaNames = append(schemaNames, schemaName)
-					}
-				}
-
-				if len(resourceType.AnyOf) > 0 {
-					for _, ref := range resourceType.AnyOf {
-						schemaName := strings.TrimPrefix(ref.Ref, componentsSchemaRefPrefix)
-						schemaNames = append(schemaNames, schemaName)
-					}
-				}
-
-				for _, n := range schemaNames {
-					dResource := o.Doc.Components.Schemas[n]
-					ensureRequestSchemaTitle(n, dResource)
-					typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
-					setUpdateOperationMapping(typeToken)
-				}
-			} else {
-				typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
-				setUpdateOperationMapping(typeToken)
-			}
-		}
-
-		if pathItem.Put != nil {
-			parentPath := getParentPath(currentPath)
-			glog.V(3).Infof("PUT: Parent path for %s is %s\n", currentPath, parentPath)
-
-			jsonReq := pathItem.Put.RequestBody.Value.Content.Get(jsonMimeType)
-			if jsonReq.Schema.Value == nil {
-				contract.Failf("Path %s has no schema definition for Put method", currentPath)
-			}
-
-			setPutOperationMapping := func(tok string) {
-				if existing, ok := o.resourceCRUDMap[tok]; ok {
-					existing.P = &currentPath
-				} else {
-					o.resourceCRUDMap[tok] = &CRUDOperationsMap{
-						P: &currentPath,
-					}
-				}
-			}
-
-			resourceType := jsonReq.Schema.Value
-			if resourceType.Title == "" {
-				resourceType.Title = getResourceTitleFromOperationID(pathItem.Put.OperationID, http.MethodPut, o.OperationIdsHaveTypeSpecNamespace)
-			}
-			if resourceType.Title == "" {
-				return nil, o.Doc, errors.Errorf("put request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
-			}
-
-			if resourceType.Discriminator != nil {
-				for _, ref := range resourceType.Discriminator.Mapping {
-					schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
-					dResource := o.Doc.Components.Schemas[schemaName]
-					ensureRequestSchemaTitle(schemaName, dResource)
-					typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
-					setPutOperationMapping(typeToken)
-				}
-			} else {
-				typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
-				setPutOperationMapping(typeToken)
-			}
-
-			// PUT methods can be used to create as well as update resources.
-			// AS LONG AS the endpoint does not end with a path param. It cannot be used
-			// to create resources if the endpoint itself requires the ID of the resource.
-			if !strings.HasSuffix(currentPath, "}") {
-				if err := o.gatherResource(currentPath, *resourceType, nil /*response type*/, pathItem.Put.Parameters, module); err != nil {
-					return nil, o.Doc, errors.Wrapf(err, "generating resource for api path %s", currentPath)
-				}
-
-				csharpNamespaces[module] = ToPascalCase(module)
-			}
-		}
-
-		if pathItem.Delete != nil {
-			parentPath := getParentPath(currentPath)
-			glog.V(3).Infof("DELETE: Parent path for %s is %s\n", currentPath, parentPath)
-
-			setDeleteOperationMapping := func(tok string) {
-				if existing, ok := o.resourceCRUDMap[tok]; ok {
-					existing.D = &currentPath
-				} else {
-					o.resourceCRUDMap[tok] = &CRUDOperationsMap{
-						D: &currentPath,
-					}
-				}
-			}
-
-			if pathItem.Delete.RequestBody != nil {
-				jsonReq := pathItem.Delete.RequestBody.Value.Content.Get(jsonMimeType)
-				if jsonReq.Schema.Value == nil {
-					contract.Failf("Path %s has no schema definition for Delete method", currentPath)
-				}
-
-				resourceType := jsonReq.Schema.Value
-				if resourceType.Title == "" {
-					resourceType.Title = getResourceTitleFromOperationID(pathItem.Delete.OperationID, http.MethodDelete, o.OperationIdsHaveTypeSpecNamespace)
-				}
-				if resourceType.Title == "" {
-					return nil, o.Doc, errors.Errorf("delete request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
-				}
-
-				if resourceType.Discriminator != nil {
-					for _, ref := range resourceType.Discriminator.Mapping {
-						schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
-						dResource := o.Doc.Components.Schemas[schemaName]
-						ensureRequestSchemaTitle(schemaName, dResource)
-						typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
-						setDeleteOperationMapping(typeToken)
-					}
-				} else {
-					typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
-					setDeleteOperationMapping(typeToken)
-				}
-			} else {
-				resourceTypeTitle := getResourceTitleFromOperationID(pathItem.Delete.OperationID, http.MethodDelete, o.OperationIdsHaveTypeSpecNamespace)
-				if resourceTypeTitle == "" {
-					return nil, o.Doc, errors.New("request body schema must have a title or the operation must have an operationid")
-				}
-				typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceTypeTitle)
-				setDeleteOperationMapping(typeToken)
-			}
-		}
-
-		if pathItem.Post == nil {
-			continue
-		}
-
-		jsonReq := pathItem.Post.RequestBody.Value.Content.Get(jsonMimeType)
-		if jsonReq.Schema.Value == nil {
-			return nil, o.Doc, errors.Errorf("path %s has no api schema definition for post method", currentPath)
-		}
-
-		resourceRequestType := jsonReq.Schema.Value
-
-		// Usually 201 and 202 status codes don't have response bodies,
-		// but some OpenAPI specs seem to have a response body for those
-		// status codes. For example, DigitalOcean responds with 202
-		// for a request to provision Floating IPs that may not be
-		// fully provisioned yet.
-		responseCodes := []int{200, 201, 202}
-		var statusCodeOkResp *openapi3.ResponseRef
-		for _, code := range responseCodes {
-			statusCodeOkResp = pathItem.Post.Responses.Get(code)
-
-			// Stop looking for response body schema if we found
-			// one already.
-			if statusCodeOkResp != nil {
-				break
-			}
-		}
-
-		var resourceResponseType *openapi3.Schema
-		if statusCodeOkResp != nil {
-			jsonResp := statusCodeOkResp.Value.Content.Get(jsonMimeType)
-			if jsonResp != nil {
-				resourceResponseType = jsonResp.Schema.Value
-			}
-		}
-
-		if resourceRequestType.Title == "" {
-			resourceRequestType.Title = getResourceTitleFromOperationID(pathItem.Post.OperationID, http.MethodPost, o.OperationIdsHaveTypeSpecNamespace)
-		}
-
-		if resourceRequestType.Title == "" {
-			return nil, o.Doc, errors.Errorf("post request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
-		}
-
-		if err := o.gatherResource(currentPath, *resourceRequestType, resourceResponseType, pathItem.Post.Parameters, module); err != nil {
-			return nil, o.Doc, errors.Wrapf(err, "generating resource for api path %s", currentPath)
-		}
-
-		csharpNamespaces[module] = ToPascalCase(module)
 	}
 
 	return &ProviderMetadata{
 		ResourceCRUDMap: o.resourceCRUDMap,
 		AutoNameMap:     o.autoNameMap,
 	}, o.Doc, nil
+}
+
+func (o *OpenAPIContext) parseOperations(pathItem *openapi3.PathItem, currentPath string, module string) error {
+	supported_ops := map[*openapi3.Operation]func() error{
+		pathItem.Get:    func() error { return o.parseGet(pathItem, pathItem.Get, currentPath, module) },
+		pathItem.Put:    func() error { return o.parsePut(pathItem, pathItem.Put, currentPath, module) },
+		pathItem.Post:   func() error { return o.parsePost(pathItem, pathItem.Post, currentPath, module) },
+		pathItem.Patch:  func() error { return o.parsePatch(pathItem, pathItem.Patch, currentPath, module) },
+		pathItem.Delete: func() error { return o.parseDelete(pathItem, pathItem.Delete, currentPath, module) },
+		//pathItem.Head:    func() error { return o.parseHead(pathItem, pathItem.Head, currentPath, module) },
+		//pathItem.Options: func() error { return o.parseOptions(pathItem, pathItem.Options, currentPath, module) },
+	}
+
+	errs := ErrorList{}
+	for _, opf := range supported_ops {
+		if opf != nil {
+			if err := opf(); err != nil {
+				errs.AddError(err)
+			}
+		}
+	}
+	if errs.HasError() {
+		return errs
+	}
+	return nil
+}
+
+func (o *OpenAPIContext) parseGet(pathItem *openapi3.PathItem, get *openapi3.Operation, currentPath string, module string) error {
+	if get == nil {
+		return nil
+	}
+
+	parentPath := getParentPath(currentPath)
+	glog.V(3).Infof("GET: Parent path for %s is %s\n", currentPath, parentPath)
+
+	jsonResp := getResponseBodyContentMediaType(get, http.StatusOK, jsonMimeType)
+	if jsonResp == nil || jsonResp.Schema == nil {
+		//contract.Failf("Path %s has no schema definition for status code 200", currentPath)
+		return newContractError("path %s has no schema definition for status code 200", currentPath)
+	}
+	setReadOperationMapping := func(tok string) {
+		if existing, ok := o.resourceCRUDMap[tok]; ok {
+			existing.R = &currentPath
+		} else {
+			o.resourceCRUDMap[tok] = &CRUDOperationsMap{
+				R: &currentPath,
+			}
+		}
+	}
+
+	resourceType := jsonResp.Schema.Value
+
+	// Use the type and operationID as a hint to determine if this GET endpoint returns a single resource
+	// or a list of resources.
+	if resourceType.Type != arrayType && !strings.Contains(strings.ToLower(get.OperationID), "list") {
+		// If there is a discriminator then we should set this operation
+		// as the read endpoint for each of the types in the mapping.
+		if resourceType.Discriminator != nil {
+			for _, ref := range resourceType.Discriminator.Mapping {
+				schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
+				dResource := o.Doc.Components.Schemas[schemaName]
+				ensureRequestSchemaTitle(schemaName, dResource)
+				typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
+				setReadOperationMapping(typeToken)
+
+				funcName := "get" + dResource.Value.Title
+				funcTypeToken := o.Pkg.Name + ":" + module + ":" + funcName
+				getterFuncSpec := o.genGetFunc(*pathItem, *dResource, module, funcName)
+				o.Pkg.Functions[funcTypeToken] = getterFuncSpec
+				setReadOperationMapping(funcTypeToken)
+			}
+		} else {
+			if resourceType.Title == "" {
+				resourceType.Title = getResourceTitleFromOperationID(pathItem.Get.OperationID, http.MethodGet, o.OperationIdsHaveTypeSpecNamespace)
+			}
+
+			typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
+			setReadOperationMapping(typeToken)
+
+			funcName := "get" + resourceType.Title
+			funcTypeToken := o.Pkg.Name + ":" + module + ":" + funcName
+			getterFuncSpec := o.genGetFunc(*pathItem, *jsonResp.Schema, module, funcName)
+			o.Pkg.Functions[funcTypeToken] = getterFuncSpec
+			setReadOperationMapping(funcTypeToken)
+		}
+	}
+
+	// Add the API operation as a list* function.
+	if resourceType.Type == arrayType || strings.Contains(strings.ToLower(pathItem.Get.OperationID), "list") {
+		var funcName string
+		if resourceType.Title != "" {
+			resourceType.Title = strings.ReplaceAll(resourceType.Title, "List", "")
+			if !strings.HasPrefix(resourceType.Title, "list") {
+				funcName = "list" + resourceType.Title
+			}
+		} else {
+			funcName = "list" + getResourceTitleFromOperationID(pathItem.Get.OperationID, http.MethodGet, o.OperationIdsHaveTypeSpecNamespace)
+		}
+		funcTypeToken := o.Pkg.Name + ":" + module + ":" + funcName
+		funcSpec, err := o.genListFunc(*pathItem, *jsonResp.Schema, funcName, module)
+		if err != nil {
+			return errors.Wrap(err, "generating list function")
+		}
+
+		o.Pkg.Functions[funcTypeToken] = *funcSpec
+		setReadOperationMapping(funcTypeToken)
+	}
+	return nil
+}
+
+func (o *OpenAPIContext) parsePatch(pathItem *openapi3.PathItem, patch *openapi3.Operation, currentPath string, module string) error {
+	if patch == nil {
+		return nil
+	}
+
+	parentPath := getParentPath(currentPath)
+	glog.V(3).Infof("PATCH: Parent path for %s is %s\n", currentPath, parentPath)
+
+	resourceType, err := getRequestBodyContentJsonSchema(pathItem.Patch)
+	if err != nil || resourceType == nil {
+		return newContractError("path %s has no schema definition for Patch method", currentPath)
+	}
+
+	setUpdateOperationMapping := func(tok string) {
+		if existing, ok := o.resourceCRUDMap[tok]; ok {
+			existing.U = &currentPath
+		} else {
+			o.resourceCRUDMap[tok] = &CRUDOperationsMap{
+				U: &currentPath,
+			}
+		}
+	}
+
+	if resourceType.Title == "" {
+		resourceType.Title = getResourceTitleFromOperationID(pathItem.Patch.OperationID, http.MethodPatch, o.OperationIdsHaveTypeSpecNamespace)
+	}
+	if resourceType.Title == "" {
+		return errors.Errorf("patch request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
+	}
+
+	if resourceType.Discriminator != nil || len(resourceType.OneOf) > 0 || len(resourceType.AnyOf) > 0 {
+		schemaNames := make([]string, 0)
+		if resourceType.Discriminator != nil {
+			for _, ref := range resourceType.Discriminator.Mapping {
+				schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
+				schemaNames = append(schemaNames, schemaName)
+			}
+		}
+
+		if len(resourceType.OneOf) > 0 {
+			for _, ref := range resourceType.OneOf {
+				schemaName := strings.TrimPrefix(ref.Ref, componentsSchemaRefPrefix)
+				schemaNames = append(schemaNames, schemaName)
+			}
+		}
+
+		if len(resourceType.AnyOf) > 0 {
+			for _, ref := range resourceType.AnyOf {
+				schemaName := strings.TrimPrefix(ref.Ref, componentsSchemaRefPrefix)
+				schemaNames = append(schemaNames, schemaName)
+			}
+		}
+
+		for _, n := range schemaNames {
+			dResource := o.Doc.Components.Schemas[n]
+			ensureRequestSchemaTitle(n, dResource)
+			typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
+			setUpdateOperationMapping(typeToken)
+		}
+	} else {
+		typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
+		setUpdateOperationMapping(typeToken)
+	}
+	return nil
+}
+
+func (o *OpenAPIContext) parsePut(pathItem *openapi3.PathItem, put *openapi3.Operation, currentPath, module string) error {
+	if put == nil {
+		return nil
+	}
+
+	parentPath := getParentPath(currentPath)
+	glog.V(3).Infof("PUT: Parent path for %s is %s\n", currentPath, parentPath)
+
+	resourceType, err := getRequestBodyContentJsonSchema(pathItem.Put)
+	if err != nil || resourceType == nil {
+		return newContractError("path %s has no schema definition for Put method", currentPath)
+	}
+	setPutOperationMapping := func(tok string) {
+		if existing, ok := o.resourceCRUDMap[tok]; ok {
+			existing.P = &currentPath
+		} else {
+			o.resourceCRUDMap[tok] = &CRUDOperationsMap{
+				P: &currentPath,
+			}
+		}
+	}
+
+	if resourceType.Title == "" {
+		resourceType.Title = getResourceTitleFromOperationID(pathItem.Put.OperationID, http.MethodPut, o.OperationIdsHaveTypeSpecNamespace)
+	}
+	if resourceType.Title == "" {
+		return errors.Errorf("put request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
+	}
+
+	if resourceType.Discriminator != nil {
+		for _, ref := range resourceType.Discriminator.Mapping {
+			schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
+			dResource := o.Doc.Components.Schemas[schemaName]
+			ensureRequestSchemaTitle(schemaName, dResource)
+			typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
+			setPutOperationMapping(typeToken)
+		}
+	} else {
+		typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
+		setPutOperationMapping(typeToken)
+	}
+
+	// PUT methods can be used to create as well as update resources.
+	// AS LONG AS the endpoint does not end with a path param. It cannot be used
+	// to create resources if the endpoint itself requires the ID of the resource.
+	if !strings.HasSuffix(currentPath, "}") {
+		if err := o.gatherResource(currentPath, *resourceType, nil /*response type*/, pathItem.Put.Parameters, module); err != nil {
+			return errors.Wrapf(err, "generating resource for api path %s", currentPath)
+		}
+
+		o.CsharpNamespaces[module] = ToPascalCase(module)
+	}
+	return nil
+}
+
+func (o *OpenAPIContext) parseDelete(pathItem *openapi3.PathItem, del *openapi3.Operation, currentPath, module string) error {
+	if del == nil {
+		return nil
+	}
+
+	parentPath := getParentPath(currentPath)
+	glog.V(3).Infof("DELETE: Parent path for %s is %s\n", currentPath, parentPath)
+
+	setDeleteOperationMapping := func(tok string) {
+		if existing, ok := o.resourceCRUDMap[tok]; ok {
+			existing.D = &currentPath
+		} else {
+			o.resourceCRUDMap[tok] = &CRUDOperationsMap{
+				D: &currentPath,
+			}
+		}
+	}
+
+	if del.RequestBody != nil {
+		resourceType, err := getRequestBodyContentJsonSchema(pathItem.Delete)
+		if err != nil || resourceType == nil {
+			return newContractError("path %s has no schema definition for Delete method", currentPath)
+		}
+		if resourceType.Title == "" {
+			resourceType.Title = getResourceTitleFromOperationID(pathItem.Delete.OperationID, http.MethodDelete, o.OperationIdsHaveTypeSpecNamespace)
+		}
+		if resourceType.Title == "" {
+			return errors.Errorf("delete request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
+		}
+
+		if resourceType.Discriminator != nil {
+			for _, ref := range resourceType.Discriminator.Mapping {
+				schemaName := strings.TrimPrefix(ref, componentsSchemaRefPrefix)
+				dResource := o.Doc.Components.Schemas[schemaName]
+				ensureRequestSchemaTitle(schemaName, dResource)
+				typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, dResource.Value.Title)
+				setDeleteOperationMapping(typeToken)
+			}
+		} else {
+			typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceType.Title)
+			setDeleteOperationMapping(typeToken)
+		}
+	} else {
+		resourceTypeTitle := getResourceTitleFromOperationID(pathItem.Delete.OperationID, http.MethodDelete, o.OperationIdsHaveTypeSpecNamespace)
+		if resourceTypeTitle == "" {
+			return errors.New("request body schema must have a title or the operation must have an operationid")
+		}
+		typeToken := fmt.Sprintf("%s:%s:%s", o.Pkg.Name, module, resourceTypeTitle)
+		setDeleteOperationMapping(typeToken)
+	}
+	return nil
+}
+
+func (o *OpenAPIContext) parsePost(pathItem *openapi3.PathItem, post *openapi3.Operation, currentPath string, module string) error {
+	if post == nil {
+		return nil
+	}
+
+	resourceRequestType, err := getRequestBodyContentJsonSchema(post)
+	if err != nil || resourceRequestType == nil {
+		return newContractError("path %s has no api schema definition for post method", currentPath)
+	}
+
+	// Usually 201 and 202 status codes don't have response bodies,
+	// but some OpenAPI specs seem to have a response body for those
+	// status codes. For example, DigitalOcean responds with 202
+	// for a request to provision Floating IPs that may not be
+	// fully provisioned yet.
+	responseCodes := []int{200, 201, 202}
+	var statusCodeOkResp *openapi3.ResponseRef
+	for _, code := range responseCodes {
+		statusCodeOkResp = pathItem.Post.Responses.Get(code)
+
+		// Stop looking for response body schema if we found
+		// one already.
+		if statusCodeOkResp != nil {
+			break
+		}
+	}
+
+	var resourceResponseType *openapi3.Schema
+	if statusCodeOkResp != nil {
+		jsonResp := statusCodeOkResp.Value.Content.Get(jsonMimeType)
+		if jsonResp == nil || jsonResp.Schema == nil || jsonResp.Schema.Value == nil {
+			//contract.Failf("Path %s has no schema definition for POST method OK response", currentPath)
+			return newContractError("path %s has no schema definition for POST method OK response", currentPath)
+		}
+		resourceResponseType = jsonResp.Schema.Value
+	}
+
+	if resourceRequestType.Title == "" {
+		resourceRequestType.Title = getResourceTitleFromOperationID(pathItem.Post.OperationID, http.MethodPost, o.OperationIdsHaveTypeSpecNamespace)
+	}
+
+	if resourceRequestType.Title == "" {
+		return errors.Errorf("post request body schema must have a title or the operation must have an operationid (path: %s)", currentPath)
+	}
+
+	if err := o.gatherResource(currentPath, *resourceRequestType, resourceResponseType, pathItem.Post.Parameters, module); err != nil {
+		return errors.Wrapf(err, "generating resource for api path %s", currentPath)
+	}
+
+	o.CsharpNamespaces[module] = ToPascalCase(module)
+
+	return nil
 }
 
 // genListFunc returns a function spec for a GET API endpoint that returns a list of objects.
@@ -755,6 +897,7 @@ func (o *OpenAPIContext) gatherResourceProperties(requestBodySchema openapi3.Sch
 
 	for propName, prop := range requestBodySchema.Properties {
 		var propSpec pschema.PropertySpec
+		var genErr error
 
 		if prop.Value.AdditionalProperties.Has != nil {
 			allowed := *prop.Value.AdditionalProperties.Has
@@ -777,10 +920,18 @@ func (o *OpenAPIContext) gatherResourceProperties(requestBodySchema openapi3.Sch
 					}
 				}
 			} else {
-				propSpec = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+				propSpec, genErr = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+				if genErr != nil {
+					o.handleError(genErr)
+					continue
+				}
 			}
 		} else {
-			propSpec = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+			propSpec, genErr = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+			if genErr != nil {
+				o.handleError(genErr)
+				continue
+			}
 		}
 
 		// Skip read-only properties and `id` properties as direct inputs for resources.
@@ -801,6 +952,7 @@ func (o *OpenAPIContext) gatherResourceProperties(requestBodySchema openapi3.Sch
 	if responseBodySchema != nil {
 		for propName, prop := range responseBodySchema.Properties {
 			var propSpec pschema.PropertySpec
+			var genErr error
 
 			if prop.Value.AdditionalProperties.Has != nil {
 				allowed := *prop.Value.AdditionalProperties.Has
@@ -823,10 +975,18 @@ func (o *OpenAPIContext) gatherResourceProperties(requestBodySchema openapi3.Sch
 						}
 					}
 				} else {
-					propSpec = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+					propSpec, genErr = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+					if genErr != nil {
+						o.handleError(genErr)
+						continue
+					}
 				}
 			} else {
-				propSpec = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+				propSpec, genErr = pkgCtx.genPropertySpec(ToPascalCase(propName), *prop)
+				if genErr != nil {
+					o.handleError(genErr)
+					continue
+				}
 			}
 
 			// Don't add `id` to the output properties since Pulumi
@@ -976,7 +1136,7 @@ func (o *OpenAPIContext) gatherResourceProperties(requestBodySchema openapi3.Sch
 // within the schema. In the case of ref's to other types, those
 // other types are automatically added to the Pulumi schema spec's
 // `Types` property.
-func (ctx *resourceContext) genPropertySpec(propName string, p openapi3.SchemaRef) pschema.PropertySpec {
+func (ctx *resourceContext) genPropertySpec(propName string, p openapi3.SchemaRef) (pschema.PropertySpec, error) {
 	propertySpec := pschema.PropertySpec{
 		Description: p.Value.Description,
 	}
@@ -1004,12 +1164,13 @@ func (ctx *resourceContext) genPropertySpec(propName string, p openapi3.SchemaRe
 
 	typeSpec, err := ctx.propertyTypeSpec(propName, p)
 	if err != nil {
-		contract.Failf("Failed to generate type spec (resource: %s, prop %s): %v", ctx.resourceName, propName, err)
+		//contract.Failf("Failed to generate type spec (resource: %s, prop %s): %v", ctx.resourceName, propName, err)
+		return propertySpec, newContractError("failed to generate type spec (resource: %s, prop %s): %v", ctx.resourceName, propName, err)
 	}
 
 	propertySpec.TypeSpec = *typeSpec
 
-	return propertySpec
+	return propertySpec, nil
 }
 
 // propertyTypeSpec converts an API schema to a Pulumi property type spec.
